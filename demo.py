@@ -1,32 +1,53 @@
 #!/usr/bin/env python3
 
+import sys
 import subprocess
-import json
 import os
-import select
 import time
+import queue
 from threading import Thread
+
+if sys.stdout.encoding and sys.stdout.encoding.lower() not in ('utf-8', 'utf8'):
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
 
 import numpy as np
 from PIL import Image
 from collections import deque
 from tqdm import tqdm
+import imageio_ffmpeg
+
+FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
 
 def get_video_info(path):
-    cmd = [
-        'ffprobe', '-v', 'error',
-        '-select_streams', 'v:0',
-        '-show_entries', 'stream=width,height,r_frame_rate,nb_frames',
-        '-of', 'json',
-        path
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    info = json.loads(result.stdout)['streams'][0]
-    w, h = int(info['width']), int(info['height'])
-    num, den = map(int, info['r_frame_rate'].split('/'))
-    fps = num / den if den else 0
-    nb_frames = int(info['nb_frames']) if info.get('nb_frames', 'N/A') != 'N/A' else None
+    """Extract video metadata using ffmpeg -i (no ffprobe dependency)."""
+    import re
+    cmd = [FFMPEG, '-i', path]
+    # ffmpeg -i exits with 1 and prints info to stderr
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    stderr = result.stderr
+
+    # Parse "Stream #0:0... Video: ... 640x480 ... 30 fps"
+    m = re.search(r'Stream\s+#.*Video:.* (\d+)x(\d+)', stderr)
+    if not m:
+        raise ValueError(f'Could not parse resolution from {path}')
+    w, h = int(m.group(1)), int(m.group(2))
+
+    # Try fps patterns: "30 fps", "29.97 fps", "30 tbr"
+    fps = 0.0
+    fps_m = re.search(r'(\d+(?:\.\d+)?)\s+fps', stderr)
+    if fps_m:
+        fps = float(fps_m.group(1))
+
+    # Try "Duration: HH:MM:SS.ss" for frame count estimate
+    nb_frames = None
+    dur_m = re.search(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)', stderr)
+    if dur_m and fps > 0:
+        hours, mins, secs = float(dur_m.group(1)), float(dur_m.group(2)), float(dur_m.group(3))
+        duration = hours * 3600 + mins * 60 + secs
+        nb_frames = int(duration * fps)
+
     return w, h, fps, nb_frames
 
 
@@ -63,7 +84,7 @@ def process(input_path, output_dir, crop_window=120, threshold=24,
     os.makedirs(output_dir, exist_ok=True)
 
     cmd = [
-        'ffmpeg', '-v', 'error',
+        FFMPEG, '-v', 'error',
         '-i', input_path,
         '-pix_fmt', 'gray',
         '-f', 'rawvideo',
@@ -79,27 +100,32 @@ def process(input_path, output_dir, crop_window=120, threshold=24,
     stderr_thread = Thread(target=drain_stderr, daemon=True)
     stderr_thread.start()
 
+    stdout_q = queue.Queue()
+    chunk_size = min(frame_size * 8, 1024 * 1024)
+    def drain_stdout():
+        while True:
+            data = proc.stdout.read(chunk_size)
+            if not data:
+                stdout_q.put(None)
+                break
+            stdout_q.put(data)
+    stdout_thread = Thread(target=drain_stdout, daemon=True)
+    stdout_thread.start()
+
     estimator = CropEstimator(window=crop_window)
 
     written = 0
     frame_nb = 0
     buf = bytearray()
-    stdout_fd = proc.stdout.fileno()
-    chunk_size = min(frame_size * 8, 1024 * 1024)
     last_progress = time.monotonic()
 
     pbar = tqdm(total=nb_frames, unit='fr', desc='Decoding',
                 dynamic_ncols=True, miniters=1)
     try:
         while True:
-            ready, _, _ = select.select([stdout_fd], [], [], 1.0)
-            if ready:
-                data = os.read(stdout_fd, chunk_size)
-                if not data:
-                    break
-                buf.extend(data)
-                last_progress = time.monotonic()
-            else:
+            try:
+                data = stdout_q.get(timeout=1.0)
+            except queue.Empty:
                 if proc.poll() is not None:
                     break
                 if time.monotonic() - last_progress > stall_timeout_s:
@@ -107,6 +133,11 @@ def process(input_path, output_dir, crop_window=120, threshold=24,
                     raise TimeoutError(
                         f'ffmpeg stalled: no output for {stall_timeout_s:.1f}s '
                         f'while processing {input_path}')
+                continue
+            if data is None:
+                break
+            buf.extend(data)
+            last_progress = time.monotonic()
 
             while len(buf) >= frame_size:
                 frame = np.frombuffer(buf[:frame_size], dtype=np.uint8).reshape(h, w)
